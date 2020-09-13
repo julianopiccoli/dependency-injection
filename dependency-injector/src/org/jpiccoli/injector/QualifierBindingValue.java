@@ -1,7 +1,7 @@
 package org.jpiccoli.injector;
 
 /**
- * Implementation of the behaviour corresponding to a given NamedBindingKey.
+ * Implementation of the behaviour corresponding to a given QualifierBindingKey.
  * Consider the following field declaration:
  * 
  * <code>
@@ -21,7 +21,7 @@ package org.jpiccoli.injector;
  *
  * @param <T>
  */
-interface NamedBindingValue<T> {
+interface QualifierBindingValue<T> {
 	
 	public T getValue() throws ReflectiveOperationException;
 

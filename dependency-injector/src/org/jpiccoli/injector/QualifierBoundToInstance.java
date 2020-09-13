@@ -1,17 +1,17 @@
 package org.jpiccoli.injector;
 
 /**
- * Implementation of the NamedBindingValue which provides the same instance
+ * Implementation of the QualifierBindingValue which provides the same instance
  * every time the getValue method is called.
  * @author Piccoli
  *
  * @param <T>
  */
-class NamedBoundToInstance<T> implements NamedBindingValue<T> {
+class QualifierBoundToInstance<T> implements QualifierBindingValue<T> {
 	
 	private T instance;
 	
-	public NamedBoundToInstance(T instance) {
+	public QualifierBoundToInstance(T instance) {
 		this.instance = instance;
 	}
 	

@@ -1,6 +1,7 @@
 package org.jpiccoli.injector;
 
 import java.lang.annotation.Annotation;
+import java.lang.reflect.AnnotatedElement;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
@@ -11,6 +12,7 @@ import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
@@ -21,6 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Provider;
+import javax.inject.Qualifier;
 import javax.inject.Singleton;
 
 /**
@@ -37,7 +40,7 @@ public class Injector {
 	
 	private Map<Class<?>, Class<?>> implementationBindings;
 	
-	private Map<NamedBindingKey<?>, NamedBindingValue<?>> namedBindings;
+	private Map<QualifierBindingKey<?, ?>, QualifierBindingValue<?>> qualifiersBindings;
 	
 	private Map<Class<?>, ScopeHandler> scopeHandlers;
 	
@@ -50,7 +53,7 @@ public class Injector {
 	 */
 	public Injector() {
 		implementationBindings = new ConcurrentHashMap<Class<?>, Class<?>>();
-		namedBindings = new ConcurrentHashMap<NamedBindingKey<?>, NamedBindingValue<?>>();
+		qualifiersBindings = new ConcurrentHashMap<QualifierBindingKey<?, ?>, QualifierBindingValue<?>>();
 		scopeHandlers = new ConcurrentHashMap<Class<?>, ScopeHandler>();
 		scopeHandlers.put(Singleton.class, new SingletonScopeHandler());
 	}
@@ -75,6 +78,25 @@ public class Injector {
 	
 	/**
 	 * Defines which class to instantiate when injecting an object of type "type" for a field
+	 * of parameter annotated with the given "qualifier" annotation.
+	 * @param qualifier Annotation annotated with the {@literal @}Qualifier annotation.
+	 * @param type Type to be injected.
+	 * @param implementation Class of objects to instantiate for the given type.
+	 */
+	public <Q, T, S extends T> void addQualifierBoundToImplementation(Class<Q> qualifier, Class<T> type, Class<S> implementation) {
+		if (qualifier.isAnnotation() && qualifier.isAnnotationPresent(Qualifier.class)) {
+			if (!implementation.isInterface() && !Modifier.isAbstract(implementation.getModifiers()) && type.isAssignableFrom(implementation)) {
+				qualifiersBindings.put(new QualifierBindingKey<Q, T>(qualifier, type), new QualifierBoundToImplementation<T, S>(this, implementation));
+			} else {
+				throw new IllegalArgumentException("The \"implementation\" parameter must be a concrete class which implements or subclasses parameter \"type\"");
+			}
+		} else {
+			throw new IllegalArgumentException("The \"qualifier\" parameter must be an annotation annotated with @Qualifier");
+		}
+	}
+	
+	/**
+	 * Defines which class to instantiate when injecting an object of type "type" for a field
 	 * or parameter annotated with the Named annotation.
 	 * The class represented by "implementation" must extend or implement the specified
 	 * type and cannot be abstract.
@@ -87,7 +109,7 @@ public class Injector {
 	 */
 	public <T, S extends T> void addNamedBoundToImplementation(Class<T> type, String name, Class<S> implementation) {
 		if (!implementation.isInterface() && !Modifier.isAbstract(implementation.getModifiers()) && type.isAssignableFrom(implementation)) {
-			namedBindings.put(new NamedBindingKey<T>(type, name), new NamedBoundToImplementation<T, S>(this, implementation));
+			qualifiersBindings.put(new NamedBindingKey<T>(type, name), new QualifierBoundToImplementation<T, S>(this, implementation));
 		} else {
 			throw new IllegalArgumentException("The \"implementation\" parameter must be a concrete class which implements or subclasses parameter \"type\"");
 		}
@@ -101,7 +123,7 @@ public class Injector {
 	 * @param instance Instance to be injected.
 	 */
 	public <T> void addNamedBoundToInstance(Class<T> type, String name, T instance) {
-		namedBindings.put(new NamedBindingKey<T>(type, name), new NamedBoundToInstance<T>(instance));
+		qualifiersBindings.put(new NamedBindingKey<T>(type, name), new QualifierBoundToInstance<T>(instance));
 	}
 	
 	/**
@@ -131,13 +153,8 @@ public class Injector {
 			// Providers are a special case. They must create injected instances of the
 			// specified parameterized type, so they are treated differently from any
 			// other type.
-			return (T) handleProvider(t);
+			return (T) new ProviderImplementation(this, getClassGenericTypeArgument(t));
 		}
-		
-		// Inject the static members of the class before the non-static ones.
-		// I'm not sure if this is JSR-330 compliant, but it seems more reasonable
-		// than doing the inverse.
-		injectStatic(c);
 		
 		ScopeHandler scopeHandler = getScopeHandler(c);
 		T injected = null;
@@ -181,13 +198,14 @@ public class Injector {
 		synchronized(staticInjectedClasses) {
 			if (!staticInjectedClasses.contains(c)) {
 				List<Class<?>> classHierarchy = listClassHierarchy(c);
+				Collections.reverse(classHierarchy);
 				
 				for (Class<?> clazz : classHierarchy) {
 					Field[] fields = clazz.getDeclaredFields();
 					for (Field field : fields) {
 						if (field.isAnnotationPresent(Inject.class) && Modifier.isStatic(field.getModifiers())) {
 							field.setAccessible(true);
-							handleField(clazz, field, null);
+							handleField(field, null);
 						}
 					}
 					
@@ -215,38 +233,68 @@ public class Injector {
 		Constructor<T> constructor = selectConstructor(c);
 		if (constructor == null) {
 			throw new InstantiationException("No constructor found for type " + c.getName());
-		}		
+		}
+		
+		// Inject the static members of the class before the non-static ones.
+		// I'm not sure if this is JSR-330 compliant, but it seems more reasonable
+		// than doing the inverse.
+		injectStatic(constructor.getDeclaringClass());
+		
 		List<Object> constructorParametersValues = handleExecutableParameters(constructor);
+		constructor.setAccessible(true);
 		T injected = constructor.newInstance(constructorParametersValues.toArray());
 		
-		List<Class<?>> classHierarchy = listClassHierarchy(c);
+		List<Class<?>> classHierarchy = listClassHierarchy(constructor.getDeclaringClass());
+		
+		// Building the list of methods to be executed. Starting searching methods from the most
+		// specialized class because we need to skip superclasses methods which are overridden
+		// by subclasses.
+		Set<String> skipMethodsSignatures = new HashSet<String>();
+		Map<Class<?>, List<Method>> methodsToExecuteMap = new HashMap<Class<?>, List<Method>>();
 		
 		for (Class<?> clazz : classHierarchy) {
+			Method[] methods = clazz.getDeclaredMethods();
+			List<Method> methodsToExecuteList = new ArrayList<Method>();
+			methodsToExecuteMap.put(clazz, methodsToExecuteList);
+			for (Method method : methods) {
+				String signature = buildMethodSignatureString(method);
+				if (!skipMethodsSignatures.contains(signature) && method.isAnnotationPresent(Inject.class) && !Modifier.isStatic(method.getModifiers())) {
+					methodsToExecuteList.add(method);
+				}
+				skipMethodsSignatures.add(signature);
+			}
+		}
+		
+		// Reverse the class hierarchy. Fields initialization and methods execution must be done
+		// in top-down hierarchy order.
+		Collections.reverse(classHierarchy);
+		
+		for (Class<?> clazz : classHierarchy) {
+			// Initializing fields of the class.
 			Field[] fields = clazz.getDeclaredFields();
 			for (Field field : fields) {
 				if (field.isAnnotationPresent(Inject.class) && !Modifier.isStatic(field.getModifiers())) {
 					field.setAccessible(true);
-					handleField(clazz, field, injected);
+					handleField(field, injected);
 				}
 			}
-			
-			Method[] methods = clazz.getDeclaredMethods();
-			for (Method method : methods) {
-				if (method.isAnnotationPresent(Inject.class) && !Modifier.isStatic(method.getModifiers())) {
-					method.setAccessible(true);
-					List<Object> methodParametersValues = handleExecutableParameters(method);
-					method.invoke(injected, methodParametersValues.toArray());
-				}
+			// Executing methods of the class.
+			List<Method> methodsToExecuteList = methodsToExecuteMap.get(clazz);
+			for (Method method : methodsToExecuteList) {
+				method.setAccessible(true);
+				List<Object> methodParametersValues = handleExecutableParameters(method);
+				method.invoke(injected, methodParametersValues.toArray());
 			}
 		}
+		
 		return injected;
 	}
 	
 	/**
-	 * List all the parent classes of class "c".
+	 * List all the class hierarchy starting from class "c".
 	 * @param c Class for which to list the parent classes.
-	 * @return The list of parent classes of class "c", starting from the
-	 * top parent.
+	 * @return The list of classes in the class hierarchy starting
+	 * from the class "c".
 	 */
 	private List<Class<?>> listClassHierarchy(Class<?> c) {
 		List<Class<?>> classHierarchy = new ArrayList<Class<?>>();
@@ -254,48 +302,79 @@ public class Injector {
 		Class<?> superClass = c.getSuperclass();
 		while(superClass != null && !superClass.equals(Object.class)) {
 			classHierarchy.add(superClass);
-			superClass = c.getSuperclass();
+			superClass = superClass.getSuperclass();
 		}
-		Collections.reverse(classHierarchy);
 		return classHierarchy;
 	}
 	
-
 	/**
-	 * Creates a Provider instance which builds instances
-	 * of the specified parameterized type.
-	 * @param t Parameterized type which specifies the class
-	 * of the objects that the Provider instance will create.
-	 * @return The created Provider instance.
+	 * Gets the actual Class parameter from the specified type.
+	 * @param t Type from which to obtain the Class parameter.
+	 * @return The Class parameter from the specified type.
 	 */
-	private Provider<?> handleProvider(Type t) {
+	private Class<?> getClassGenericTypeArgument(Type t) {
 		ParameterizedType parameterizedType = (ParameterizedType) t;
 		Class<?> classParam = (Class<?>) parameterizedType.getActualTypeArguments()[0];
-		return new ProviderImplementation(this, classParam);
+		return classParam;
 	}
 	
 	/**
 	 * Handle the injection of the specified field of the given instance.
-	 * @param clazz Declared class of the given field.
 	 * @param field Field to be processed.
 	 * @param instance Instance on which to inject the object.
 	 * @throws ReflectiveOperationException
 	 */
-	private void handleField(Class<?> clazz, Field field, Object instance) throws ReflectiveOperationException {
+	private void handleField(Field field, Object instance) throws ReflectiveOperationException {
 		Class<?> parameterClass = field.getType();
 		Type parameterType = field.getGenericType();
-		Named named = field.getAnnotation(Named.class);
-		if (named != null) {
-			NamedBindingKey<?> key = new NamedBindingKey(parameterClass, named.value());
-			NamedBindingValue<?> value = namedBindings.get(key);
-			if (value != null) {
-				field.set(instance, value.getValue());
-			} else {
-				throw new IllegalArgumentException("Named param not configured for field " + field.getName() + " of class " + clazz.getName());
-			}
+		Object value = handleQualifiedAnnotations(field, parameterClass, parameterType);
+		if (value != null) {
+			field.set(instance, value);
 		} else {
 			field.set(instance, inject(parameterClass, parameterType));
 		}
+	}
+	
+	/**
+	 * Handle any annotation which is a itself annotated with {@literal @}Qualifier on
+	 * the given annotatedElement. If any such annotation is found, this method returns
+	 * the injected object. Otherwise, it returns null.
+	 * @param annotatedElement The element which may contain annotations.
+	 * @param annotatedElementClass The class of the annotated element.
+	 * @param annotatedElementGenericType The generic type of the annotated element (may be null)
+	 * @return The injected object in case any {@literal @}Qualifier annotation is found on the annotatedElement
+	 * or null otherwise.
+	 * @throws ReflectiveOperationException
+	 */
+	private Object handleQualifiedAnnotations(AnnotatedElement annotatedElement, Class<?> annotatedElementClass, Type annotatedElementGenericType) throws ReflectiveOperationException {
+		Annotation[] annotations = annotatedElement.getAnnotations();
+		for (Annotation annotation : annotations) {
+			if (annotation.annotationType().isAnnotationPresent(Qualifier.class)) {
+				QualifierBindingKey<?, ?> key;
+				Class<?> classParam = annotatedElementClass;
+				boolean isProvider = annotatedElementClass.equals(Provider.class);
+				if (isProvider) {
+					classParam = getClassGenericTypeArgument(annotatedElementGenericType);
+				}
+				if (annotation.annotationType().equals(Named.class)) {
+					Named named = (Named) annotation;
+					key = new NamedBindingKey(classParam, named.value());
+				} else {
+					key = new QualifierBindingKey(annotation.annotationType(), classParam);
+				}
+				QualifierBindingValue<?> value = qualifiersBindings.get(key);
+				if (value != null) {
+					if (isProvider) {
+						return new QualifiedProviderImplementation(value);
+					} else {
+						return value.getValue();
+					}
+				} else {
+					throw new IllegalArgumentException("Qualifier not bound for annotation " + annotation.toString() + " on type " + annotatedElementClass.getName());
+				}
+			}
+		}
+		return null;
 	}
 	
 	/**
@@ -312,15 +391,9 @@ public class Injector {
 			for (Parameter parameter : parameters) {
 				Class<?> parameterClass = parameter.getType();
 				Type parameterType = parameter.getParameterizedType();
-				Named named = parameter.getAnnotation(Named.class);
-				if (named != null) {
-					NamedBindingKey<?> key = new NamedBindingKey(parameterClass, named.value());
-					NamedBindingValue<?> value = namedBindings.get(key);
-					if (value != null) {
-						parametersValues.add(value.getValue());
-					} else {
-						throw new IllegalArgumentException("Named param not configured for parameter " + parameter.getName() + " of executable " + executable.getName() );
-					}
+				Object value = handleQualifiedAnnotations(parameter, parameterClass, parameterType);
+				if (value != null) {
+					parametersValues.add(value);
 				} else {
 					parametersValues.add(inject(parameterClass, parameterType));
 				}
@@ -340,25 +413,22 @@ public class Injector {
 	 */
 	private <T, S extends T> Constructor<S> selectConstructor(Class<T> c) {
 
-		Constructor<S> nullArgsConstructor = null;
-		
-		Constructor<?>[] constructors = c.getDeclaredConstructors();
-		for (Constructor<?> constructor : constructors) {
-			if (constructor.getParameterCount() == 0) {
-				nullArgsConstructor = (Constructor<S>) constructor;
+		Class<S> boundImplementation = (Class<S>) implementationBindings.get(c);
+		if (boundImplementation != null) {
+			return selectConstructor(boundImplementation);
+		} else {
+			Constructor<S> nullArgsConstructor = null;
+			Constructor<?>[] constructors = c.getDeclaredConstructors();
+			for (Constructor<?> constructor : constructors) {
+				if (constructor.getParameterCount() == 0) {
+					nullArgsConstructor = (Constructor<S>) constructor;
+				}
+				if (constructor.isAnnotationPresent(Inject.class)) {
+					return (Constructor<S>) constructor;
+				}
 			}
-			if (constructor.isAnnotationPresent(Inject.class)) {
-				return (Constructor<S>) constructor;
-			}
+			return nullArgsConstructor;
 		}
-		
-		if (nullArgsConstructor == null) {
-			Class<S> boundImplementation = (Class<S>) implementationBindings.get(c);
-			if (boundImplementation != null) {
-				return selectConstructor(boundImplementation);
-			}
-		}
-		return nullArgsConstructor;
 		
 	}
 	
@@ -371,6 +441,43 @@ public class Injector {
 			}
 		}
 		return null;
+	}
+	
+	/**
+	 * Builds a signature string for the specified method.
+	 * The returned string will be formatted according to the
+	 * following rules:
+	 * <ul>
+	 * 	<li>public and protected methods: *.[method name]([param 1 class name], [param 2 class name], ...)</li>
+	 * 	<li>package private methods: [package name].[method name]([param 1 class name], [param 2 class name], ...)</li>
+	 * 	<li>private methods: [class name].[method name]([param 1 class name], [param 2 class name], ...)</li>
+	 * </ul>
+	 * 
+	 * @param method Method for which to build the signature
+	 * @return The signature of the given method
+	 */
+	private String buildMethodSignatureString(Method method) {
+		StringBuilder signature = new StringBuilder();
+		if (Modifier.isPrivate(method.getModifiers()) ) {
+			signature.append(method.getDeclaringClass().getName());
+			signature.append(".");
+		} else if (!Modifier.isProtected(method.getModifiers()) && !Modifier.isPublic(method.getModifiers())) {
+			signature.append(method.getDeclaringClass().getPackage().getName());
+			signature.append(".");
+		} else {
+			signature.append("*.");
+		}
+		signature.append(method.getName() + "(");
+		Parameter[] parameters = method.getParameters();
+		for (int i = 0; i < parameters.length; i++) {
+			if (i > 0) {
+				signature.append(",");
+			}
+			signature.append(parameters[i].getType().getName());
+		}
+		signature.append(")");
+		return signature.toString();
+		
 	}
 	
 }
