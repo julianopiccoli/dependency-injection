@@ -42,6 +42,8 @@ public class Injector {
 	
 	private Map<QualifierBindingKey<?, ?>, QualifierBindingValue<?>> qualifiersBindings;
 	
+	private Map<Class<?>, Provider<?>> providersBindings;
+	
 	private Map<Class<?>, ScopeHandler> scopeHandlers;
 	
 	static {
@@ -54,6 +56,7 @@ public class Injector {
 	public Injector() {
 		implementationBindings = new ConcurrentHashMap<Class<?>, Class<?>>();
 		qualifiersBindings = new ConcurrentHashMap<QualifierBindingKey<?, ?>, QualifierBindingValue<?>>();
+		providersBindings = new ConcurrentHashMap<Class<?>, Provider<?>>();
 		scopeHandlers = new ConcurrentHashMap<Class<?>, ScopeHandler>();
 		scopeHandlers.put(Singleton.class, new SingletonScopeHandler());
 	}
@@ -126,6 +129,10 @@ public class Injector {
 		qualifiersBindings.put(new NamedBindingKey<T>(type, name), new QualifierBoundToInstance<T>(instance));
 	}
 	
+	public <T> void addProviderBinding(Class<T> type, Provider<T> provider) {
+		providersBindings.put(type, provider);
+	}
+	
 	/**
 	 * Retrieve the instance to be injected for the given class.
 	 * @param c Class of the instance to be injected.
@@ -153,7 +160,12 @@ public class Injector {
 			// Providers are a special case. They must create injected instances of the
 			// specified parameterized type, so they are treated differently from any
 			// other type.
-			return (T) new ProviderImplementation(this, getClassGenericTypeArgument(t));
+			Class<?> genericType = getClassGenericTypeArgument(t);
+			Provider<?> provider = providersBindings.get(genericType);
+			if (provider != null) {
+				return (T) provider;
+			}
+			return (T) new ProviderImplementation(this, genericType);
 		}
 		
 		ScopeHandler scopeHandler = getScopeHandler(c);
@@ -230,6 +242,10 @@ public class Injector {
 	 * @throws ReflectiveOperationException
 	 */
 	private <T> T createInstance(Class<T> c) throws ReflectiveOperationException {
+		Provider<T> provider = (Provider<T>) providersBindings.get(c);
+		if (provider != null) {
+			return provider.get();
+		}
 		Constructor<T> constructor = selectConstructor(c);
 		if (constructor == null) {
 			throw new InstantiationException("No constructor found for type " + c.getName());

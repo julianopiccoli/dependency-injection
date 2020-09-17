@@ -12,6 +12,7 @@ public class Test {
 		testStaticInjection();
 		testNamedInjection();
 		testSingletonInjection();
+		testCustomProviderInjection();
 	}
 	
 	private static void testInjection() throws ReflectiveOperationException {
@@ -102,6 +103,18 @@ public class Test {
 		assert h.getG2() == h.getG3();
 		assert h.getG1() == injector.inject(G.class);
 		System.out.println("Test 7 OK");
+		
+	}
+	
+	public static void testCustomProviderInjection() throws ReflectiveOperationException {
+		
+		Injector injector = new Injector();
+		CustomProvider customProvider = new CustomProvider();
+		injector.addProviderBinding(C.class, customProvider);
+		C instance = injector.inject(C.class);
+		assert instance != null;
+		assert customProvider.isProviderCalled();
+		System.out.println("Test 8 OK");
 		
 	}
 	
